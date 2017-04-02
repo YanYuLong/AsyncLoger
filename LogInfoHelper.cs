@@ -15,21 +15,24 @@ namespace Model
         #region Field
         private static Object m_Lock = new object();
         // 消息队列 (内部加锁访问)
-        private Queue<MessageInfo> m_MessageQueue = new Queue<MessageInfo>();
-        private string m_Path = System.IO.Path.Combine(System.Environment.CurrentDirectory, "LogInfo");
-        private readonly string m_ExceptionFileBaseName="Excep";
-        private readonly string m_LogFileBaseName="Log";
+        private Queue<IGetWriteLogInfo> m_MessageQueue = new Queue<IGetWriteLogInfo>();
         private Thread m_BackWriteThread;
         private static LogInfoHelper m_Instance = null;
         private static readonly object syncObj = new object();
         #endregion
 
         #region  Method
-        private bool WriteRunTimeMessage(string message, RunTimeMessageType messageType)
+        /// <summary>
+        /// 向日志文件中写入运行时信息
+        /// </summary>
+        /// <param name="message">要写入的运行时消息</param>
+        /// <param name="messageType"></param>
+        /// <returns></returns>
+        private bool WriteRunTimeMessage(IGetWriteLogInfo logInfo)
         {
             lock (m_Lock)
             {
-                m_MessageQueue.Enqueue(new MessageInfo(message, messageType));
+                m_MessageQueue.Enqueue(logInfo);
             }
             return true;
         }
@@ -41,44 +44,20 @@ namespace Model
         /// <param name="messageType">要写入的日志类型</param>
         /// <param name="isAutoAddTimeInfo">是否在写入的信息前加上当前系统时间</param>
         /// <returns></returns>
-        public bool WriteRunTimeMessage(string Message, RunTimeMessageType messageType, bool isAutoAddTimeInfo)
+        public bool WriteRunTimeMessage(IGetWriteLogInfo logInfo, bool isAutoAddTimeInfo)
         {
-            string message = string.Empty;
-            if (isAutoAddTimeInfo)
-            {
-                message = string.Format("Time->{0} {1}", DateTime.Now.ToString(), Message);
-            }
-            else
-            {
-                message = Message;
-            }
-            return WriteRunTimeMessage(message, messageType);
+            logInfo.Message = DateTime.Now.ToString() + "->" + logInfo.Message;
+            return WriteRunTimeMessage(logInfo);
         }
         /// <summary>
         /// 异步写文件线程入口函数
         /// </summary>
         private void WriteTreadHandler()
         {
-            Queue<MessageInfo> tempQueue = new Queue<MessageInfo>();
-            StreamWriter sw = null;
-            StreamWriter expSw = null;
-            StreamWriter logSw = null;
-            if (!Directory.Exists(m_Path))
-            {
-                Directory.CreateDirectory(m_Path);
-            }
-            DateTime dtNow = DateTime.Now;
-            string expFileName = m_ExceptionFileBaseName + "-" + dtNow.ToShortDateString() + ".log";
-            string expFilePath = System.IO.Path.Combine(m_Path, expFileName);
-            expFilePath = expFilePath.Replace('/', '-');
-            expSw = new StreamWriter(expFilePath, true, Encoding.UTF8, 1024);
-
-            string logFileName = m_LogFileBaseName + "-" + dtNow.ToShortDateString() + ".log";
-            string logFilePath = System.IO.Path.Combine(m_Path, logFileName);
-            logFilePath = logFilePath.Replace('/', '-');
-            logSw = new StreamWriter(logFilePath, true, Encoding.UTF8, 1024);
+            Queue<IGetWriteLogInfo> tempQueue = new Queue<IGetWriteLogInfo>();
             while (true)
             {
+                StreamWriter sw = null;
                 #region 加锁拷贝部分
                 lock (m_MessageQueue)
                 {
@@ -101,35 +80,31 @@ namespace Model
                     int nowTempQueueCount = tempQueue.Count;
                     for (int i = 0; i < nowTempQueueCount; i++)
                     {
-                        MessageInfo messageInfo = tempQueue.Dequeue();
+                        IGetWriteLogInfo messageInfo = tempQueue.Dequeue();
                         long fileSize = 0;
-                        if (messageInfo.Type == RunTimeMessageType.Exception)
+
+                        DateTime dtNow = DateTime.Now;
+                        //日志文件名称
+                        string FileName = messageInfo.BaseFileName + "-" + dtNow.ToShortDateString() + ".log";
+                        //日志文件的完整路径
+                        string FilePath = System.IO.Path.Combine(messageInfo.DictionaryPath, FileName);
+                        FilePath = FilePath.Replace("/", "-");
+                        //判断日志文件的大小
+                        if (File.Exists(FilePath))
                         {
-                            if (expSw.BaseStream == null || !expSw.BaseStream.CanWrite)
+                            FileInfo FileInfo = new FileInfo(FilePath);
+                            fileSize = FileInfo.Length / 1024 / 1024;
+                            //当天异常日志大于10M的时候停止继续写入异常信息（PS：万一异常超级多 硬盘岂不是要炸~_~  服务器上全天跑着鬼知道那儿有bug）
+                            if (fileSize > 10)
                             {
-                                expSw = new StreamWriter(expFilePath, true, Encoding.UTF8, 1024);
+                                continue;
                             }
-                            sw = expSw;
-                            FileInfo exceptionFileInfo = new FileInfo(expFilePath);
-                            fileSize = exceptionFileInfo.Length / 1024 / 1024;
                         }
-                        else if (messageInfo.Type == RunTimeMessageType.Log)
-                        {
-                            if (logSw.BaseStream == null || !logSw.BaseStream.CanWrite)
-                            {
-                                logSw = new StreamWriter(logFilePath, true, Encoding.UTF8, 1024);
-                            }
-                            sw = logSw;
-                            FileInfo logsFileInfo = new FileInfo(logFilePath);
-                            fileSize = logsFileInfo.Length / 1024 / 1024;
-                        }
-                        //当天异常日志大于10M的时候停止继续写入异常信息（PS：万一异常超级多 硬盘岂不是要炸~_~  服务器上全天跑着鬼知道那儿有bug）
-                        if (fileSize > 10)
-                        {
-                            sw.Close();
-                        }
-                        //sw.WriteLine("------------------------------------------------------------");
+                        sw = new StreamWriter(FilePath, true, Encoding.UTF8, 1024);
+                        sw.AutoFlush = true;
                         sw.WriteLine(messageInfo.Message);
+                        sw.Close();
+                        //sw.WriteLine("------------------------------------------------------------");
                     }
                 }
                 catch (Exception exp)
@@ -160,44 +135,11 @@ namespace Model
             m_BackWriteThread.Name = "异步写入日志文件线程";
             m_BackWriteThread.Start();
         }
-
-        /// <summary>
-        /// 指定异常文件和日志文件基名称的构造函数 
-        /// </summary>
-        /// <param name="BaseExceptionFileName">异常文件的基名称</param>
-        /// <param name="BaseLogFileName">日志文件的基名称</param>
-        private LogInfoHelper(string BaseExceptionFileName, string BaseLogFileName):this()
-        {
-            m_ExceptionFileBaseName = BaseExceptionFileName;
-            m_LogFileBaseName = BaseLogFileName;
-        }
         #endregion
         /// <summary>
         /// 获取LogInfoHelper的实例
         /// </summary>
         public static LogInfoHelper GetInstance()
-        {
-                if (null == m_Instance)
-                {
-                    lock (syncObj)
-                    {
-                        if (null == m_Instance)
-                        {
-                            m_Instance = new LogInfoHelper();
-                        }
-                    }
-                }
-                return m_Instance;
-        }
-
-        /// <summary>
-        /// 获取LogInfoHelper的实例 并指定异常和日志文件的基名称 (PS：基名称只能指定一次)
-        /// </summary>
-        /// <param name="ExceptionFileBaseName"></param>
-        /// <param name="LogFileBas
-        /// eName"></param>
-        /// <returns></returns>
-        public static LogInfoHelper GetInstance(string ExceptionFileBaseName,string LogFileBaseName)
         {
             if (null == m_Instance)
             {
@@ -205,54 +147,119 @@ namespace Model
                 {
                     if (null == m_Instance)
                     {
-                        m_Instance = new LogInfoHelper(ExceptionFileBaseName,LogFileBaseName);
+                        m_Instance = new LogInfoHelper();
                     }
                 }
             }
             return m_Instance;
         }
+
     }
 
     /// <summary>
     /// 运行时需要写入到日志文件的信息类型
     /// </summary>
-    public enum RunTimeMessageType
+    public class LogMessageInfo : IGetWriteLogInfo
     {
-        Exception,
-        Log
-    }
 
-    /// <summary>
-    /// runTimeInfo的抽象类
-    /// </summary>
-    internal class MessageInfo
-    {
+        #region field
+        private string m_BaseName;
+
+        private string m_MessageType;
+
         private string m_Message = string.Empty;
-        private RunTimeMessageType m_Type;
 
+        private string m_DictionaryPath = string.Empty;
+        #endregion
+
+        #region property
+        /// <summary>
+        /// 写入日志文件的基础文件名称
+        /// </summary>
+        public string BaseFileName
+        {
+            get { return m_BaseName; }
+        }
+        /// <summary>
+        /// 写入日志文件的日志类型
+        /// </summary>
+        public string MessageType
+        {
+            get { return m_MessageType; }
+        }
+        /// <summary>
+        /// 写入日志文件的日志信息
+        /// </summary>
         public string Message
         {
             get { return m_Message; }
-        }
-        public RunTimeMessageType Type
-        {
-            get { return m_Type; }
-        }
-
-        public MessageInfo(string message, RunTimeMessageType type)
-        {
-            m_Message = message;
-            m_Type = type;
+            set { if (!string.IsNullOrEmpty(value)) { m_Message = value; } }
         }
         /// <summary>
-        /// 深拷贝方法
+        /// 写入日志的文件存放目录
+        /// </summary>
+        public string DictionaryPath
+        {
+            get { return m_DictionaryPath; }
+        }
+        #endregion
+
+        #region constructor
+        public LogMessageInfo(string DictionaryPath, string MessageFileBaseString, string MessageType, string Message)
+        {
+            if (!string.IsNullOrEmpty(DictionaryPath) && System.IO.Directory.Exists(DictionaryPath))
+            {
+                m_DictionaryPath = DictionaryPath;
+            }
+            else
+            {
+                throw new Exception("指定存放异常文件的目录不存在或者错误！！");
+            }
+            if (!string.IsNullOrEmpty(MessageFileBaseString) && !string.IsNullOrEmpty(MessageType))
+            {
+                m_BaseName = MessageFileBaseString;
+                m_MessageType = MessageType;
+                m_Message = Message;
+            }
+        }
+        #endregion
+
+        /// <summary>
+        /// 获取要写入到日志文件的字符串数据
         /// </summary>
         /// <returns></returns>
-        public MessageInfo DeepClon()
+        public string GetLogString()
         {
-            MessageInfo result = new MessageInfo(m_Message, m_Type);
-            return result;
+            return m_Message;
         }
+    }
+
+    /// <summary>
+    /// 获取要写入到日志文件中的文字字符串
+    /// </summary>
+    public interface IGetWriteLogInfo
+    {
+        /// <summary>
+        /// 获取要写入到日志文件的字符串信息
+        /// </summary>
+        /// <returns></returns>
+        string GetLogString();
+        /// <summary>
+        /// 获取写入的日志文件的基名称
+        /// </summary>
+        string BaseFileName { get; }
+        /// <summary>
+        /// 获取写入的日志的日志类型
+        /// </summary>
+        string MessageType { get; }
+        /// <summary>
+        /// 获取要写入的日志的消息
+        /// </summary>
+        string Message { get; set; }
+        /// <summary>
+        /// 获取要写入日志文件的文件夹路径
+        /// </summary>
+        string DictionaryPath { get; }
     }
 }
 
